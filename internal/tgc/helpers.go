@@ -11,6 +11,7 @@ import (
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
+	"github.com/tgdrive/teldrive/internal/cache"
 	"github.com/tgdrive/teldrive/internal/config"
 	"github.com/tgdrive/teldrive/internal/utils"
 	"github.com/tgdrive/teldrive/pkg/types"
@@ -24,6 +25,14 @@ var (
 )
 
 func GetChannelById(ctx context.Context, client *tg.Client, channelId int64) (*tg.InputChannel, error) {
+	channel, err := GetChannelFull(ctx, client, channelId)
+	if err != nil {
+		return nil, err
+	}
+	return channel.AsInput(), nil
+}
+
+func GetChannelFull(ctx context.Context, client *tg.Client, channelId int64) (*tg.Channel, error) {
 	inputChannel := &tg.InputChannel{
 		ChannelID: channelId,
 	}
@@ -35,7 +44,7 @@ func GetChannelById(ctx context.Context, client *tg.Client, channelId int64) (*t
 	if len(channels.GetChats()) == 0 {
 		return nil, ErrInValidChannelId
 	}
-	return channels.GetChats()[0].(*tg.Channel).AsInput(), nil
+	return channels.GetChats()[0].(*tg.Channel), nil
 }
 
 func DeleteMessages(ctx context.Context, client *telegram.Client, channelId int64, ids []int) error {
@@ -55,7 +64,7 @@ func DeleteMessages(ctx context.Context, client *telegram.Client, channelId int6
 
 		g.SetLimit(runtime.NumCPU())
 
-		for i := 0; i < batchCount; i++ {
+		for i := range batchCount {
 			start := i * batchSize
 			end := min((i+1)*batchSize, len(ids))
 			batchIds := ids[start:end]
@@ -175,18 +184,22 @@ func GetMediaContent(ctx context.Context, client *tg.Client, location tg.InputFi
 			break
 		}
 		buff.Write(r)
-		offset += int64(limit)
+		offset += limit
 	}
 	return buff, nil
 }
 
-func GetBotInfo(ctx context.Context, db *gorm.DB, config *config.TGConfig, token string) (*types.BotInfo, error) {
+func GetBotInfo(ctx context.Context, db *gorm.DB, cache cache.Cacher, config *config.TGConfig, token string) (*types.BotInfo, error) {
 	var user *tg.User
 	middlewares := NewMiddleware(config, WithFloodWait(), WithRateLimit())
-	client, _ := BotClient(ctx, db, config, token, middlewares...)
-	err := RunWithAuth(ctx, client, token, func(ctx context.Context) error {
-		user, _ = client.Self(ctx)
-		return nil
+	client, err := BotClient(ctx, db, cache, config, token, middlewares...)
+	if err != nil {
+		return nil, err
+	}
+	err = RunWithAuth(ctx, client, token, func(ctx context.Context) error {
+		var err error
+		user, err = client.Self(ctx)
+		return err
 	})
 	if err != nil {
 		return nil, err

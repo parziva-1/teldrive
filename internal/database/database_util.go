@@ -2,8 +2,6 @@ package database
 
 import (
 	"embed"
-	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -49,28 +47,11 @@ func NewTestDatabase(tb testing.TB, migration bool) *gorm.DB {
 	return db
 
 }
-func DeleteRecordAll(_ testing.TB, db *gorm.DB, tableWhereClauses []string) error {
-	if len(tableWhereClauses)%2 != 0 {
-		return errors.New("must exist table and where clause")
-	}
-
-	for i := 0; i < len(tableWhereClauses)-1; i += 2 {
-		rowDB, err := db.DB()
-		if err != nil {
-			return err
-		}
-		query := fmt.Sprintf("DELETE FROM %s WHERE %s", tableWhereClauses[i], tableWhereClauses[i+1])
-		_, err = rowDB.Exec(query)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
 func MigrateDB(db *gorm.DB) error {
 	sqlDb, _ := db.DB()
 	goose.SetBaseFS(embedMigrations)
+	goose.SetLogger(goose.NopLogger())
 
 	if err := goose.SetDialect("postgres"); err != nil {
 		return err

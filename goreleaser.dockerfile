@@ -1,4 +1,5 @@
 FROM scratch
-COPY teldrive /teldrive
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/teldrive /teldrive
 EXPOSE 8080
-ENTRYPOINT ["/teldrive","run","--tg-storage-file","/storage.db"]
+ENTRYPOINT ["/teldrive","run"]

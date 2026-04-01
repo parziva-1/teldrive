@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/gotd/td/session"
+	"github.com/gotd/td/telegram"
 	tgauth "github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/auth/qrlogin"
 	"github.com/gotd/td/tg"
@@ -28,6 +30,7 @@ import (
 	"github.com/tgdrive/teldrive/internal/cache"
 	"github.com/tgdrive/teldrive/internal/logging"
 	"github.com/tgdrive/teldrive/internal/tgc"
+	"github.com/tgdrive/teldrive/internal/utils"
 	"github.com/tgdrive/teldrive/pkg/models"
 	"github.com/tgdrive/teldrive/pkg/types"
 	"go.uber.org/zap"
@@ -78,12 +81,12 @@ func (a *apiService) AuthLogin(ctx context.Context, session *api.SessionCreate) 
 			return err
 		}
 		file := &models.File{
-			Name:     "root",
-			Type:     "folder",
-			MimeType: "drive/folder",
-			UserId:   session.UserId,
-			Status:   "active",
-			Parts:    nil,
+			Name:      "root",
+			Type:      "folder",
+			MimeType:  "drive/folder",
+			UserId:    session.UserId,
+			Status:    "active",
+			UpdatedAt: utils.Ptr(time.Now().UTC()),
 		}
 		if err := a.db.Clauses(clause.OnConflict{DoNothing: true}).Create(file).Error; err != nil {
 			return err
@@ -93,7 +96,10 @@ func (a *apiService) AuthLogin(ctx context.Context, session *api.SessionCreate) 
 	if err != nil {
 		return nil, &apiError{err: err}
 	}
-	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, session.Session, a.middlewares...)
+	client, err := tgc.AuthClient(ctx, &a.cnf.TG, session.Session, a.newMiddlewares(ctx, 5)...)
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
 
 	var auth *tg.Authorization
 
@@ -124,13 +130,14 @@ func (a *apiService) AuthLogin(ctx context.Context, session *api.SessionCreate) 
 
 func (a *apiService) AuthLogout(ctx context.Context) (*api.AuthLogoutNoContent, error) {
 	authUser := auth.GetJWTUser(ctx)
-	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, authUser.TgSession, a.middlewares...)
+	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, authUser.TgSession, a.newMiddlewares(ctx, 5)...)
 	tgc.RunWithAuth(ctx, client, "", func(ctx context.Context) error {
 		_, err := client.API().AuthLogOut(ctx)
 		return err
 	})
 	a.db.Where("hash = ?", authUser.Hash).Delete(&models.Session{})
-	a.cache.Delete(cache.Key("sessions", authUser.Hash), cache.Key("users", "sessions", authUser.ID))
+	userId, _ := strconv.ParseInt(authUser.Subject, 10, 64)
+	a.cache.Delete(ctx, cache.KeySessionHash(authUser.Hash), cache.KeyUserSessions(userId))
 	return &api.AuthLogoutNoContent{SetCookie: setCookie(authCookieName, "", -1)}, nil
 }
 
@@ -138,7 +145,7 @@ func (a *apiService) AuthSession(ctx context.Context, params api.AuthSessionPara
 	if params.AccessToken.Value == "" {
 		return &api.AuthSessionNoContent{}, nil
 	}
-	claims, err := auth.VerifyUser(a.db, a.cache, a.cnf.JWT.Secret, params.AccessToken.Value)
+	claims, err := auth.VerifyUser(ctx, a.db, a.cache, a.cnf.JWT.Secret, params.AccessToken.Value)
 
 	if err != nil {
 		return &api.AuthSessionNoContent{}, nil
@@ -185,17 +192,20 @@ func (e *extendedService) AuthWs(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	logger := logging.FromContext(ctx)
+	logger := logging.Component("AUTH").With(
+		zap.String("remote_addr", r.RemoteAddr),
+		zap.String("auth_method", "qr"),
+	)
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		logger.Error("websocket upgrade error", zap.Error(err))
+		logger.Error("websocket.upgrade_failed", zap.Error(err))
 		http.Error(w, "could not upgrade connection", http.StatusBadRequest)
 		return
 	}
 
 	defer func() {
 		if err := conn.Close(); err != nil {
-			logger.Error("error closing websocket connection", zap.Error(err))
+			logger.Error("websocket.close_failed", zap.Error(err))
 		}
 	}()
 
@@ -204,7 +214,7 @@ func (e *extendedService) AuthWs(w http.ResponseWriter, r *http.Request) {
 	sessionStorage := &session.StorageMemory{}
 	tgClient, err := tgc.NoAuthClient(ctx, &e.api.cnf.TG, dispatcher, sessionStorage)
 	if err != nil {
-		logger.Error("error creating telegram client", zap.Error(err))
+		logger.Error("telegram.client_create_failed", zap.Error(err))
 		return
 	}
 
@@ -221,135 +231,141 @@ func (e *extendedService) AuthWs(w http.ResponseWriter, r *http.Request) {
 			}
 			switch message.AuthType {
 			case "qr":
-				go func() {
-					authorization, err := tgClient.QR().Auth(ctx, loggedIn, func(ctx context.Context, token qrlogin.Token) error {
-						conn.WriteJSON(map[string]any{"type": "auth", "payload": map[string]string{"token": token.URL()}})
-						return nil
-					})
-
-					if errors.Is(err, context.Canceled) {
-						return
-					}
-					if tgerr.Is(err, "SESSION_PASSWORD_NEEDED") {
-						conn.WriteJSON(map[string]any{"type": "auth", "message": "2FA required"})
-						return
-					}
-
-					if err != nil {
-						logger.Error("QR auth error", zap.Error(err))
-						conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
-						return
-					}
-					user, ok := authorization.User.AsNotEmpty()
-					if !ok {
-						conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
-						return
-					}
-					if !checkUserIsAllowed(e.api.cnf.JWT.AllowedUsers, user.Username) {
-						conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
-						tgClient.API().AuthLogOut(ctx)
-						return
-					}
-					res, _ := sessionStorage.LoadSession(ctx)
-					sessionData := &types.SessionData{}
-					json.Unmarshal(res, sessionData)
-					session := prepareSession(user, &sessionData.Data)
-					conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
-				}()
+				go e.handleQRAuth(ctx, conn, tgClient, loggedIn, sessionStorage, logger)
 			case "phone":
-				if message.Message == "sendcode" {
-					go func() {
-						res, err := tgClient.Auth().SendCode(ctx, message.PhoneNo, tgauth.SendCodeOptions{})
-						if errors.Is(err, context.Canceled) {
-							return
-						}
-						logger.Error("error sending code", zap.Error(err))
-						if err != nil {
-							conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
-							return
-						}
-						code := res.(*tg.AuthSentCode)
-						conn.WriteJSON(map[string]any{"type": "auth", "payload": map[string]string{"phoneCodeHash": code.PhoneCodeHash}})
-					}()
-				} else if message.Message == "signin" {
-					go func() {
-						auth, err := tgClient.Auth().SignIn(ctx, message.PhoneNo, message.PhoneCode, message.PhoneCodeHash)
-						if errors.Is(err, context.Canceled) {
-							return
-						}
-						if errors.Is(err, tgauth.ErrPasswordAuthNeeded) {
-							conn.WriteJSON(map[string]any{"type": "auth",
-								"message": tgauth.ErrPasswordAuthNeeded.Error()})
-							return
-						}
-						if tgerr.Is(err, "PHONE_CODE_INVALID") {
-							conn.WriteJSON(map[string]any{"type": "auth", "message": "PHONE_CODE_INVALID"})
-							return
-						}
-						if err != nil {
-							logger.Error("phone sign-in error", zap.Error(err))
-							conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
-							return
-						}
-						user, ok := auth.User.AsNotEmpty()
-						if !ok {
-							conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
-							return
-						}
-						if !checkUserIsAllowed(e.api.cnf.JWT.AllowedUsers, user.Username) {
-							conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
-							tgClient.API().AuthLogOut(ctx)
-							return
-						}
-						res, _ := sessionStorage.LoadSession(ctx)
-						sessionData := &types.SessionData{}
-						json.Unmarshal(res, sessionData)
-						session := prepareSession(user, &sessionData.Data)
-						conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
-					}()
-				}
+				go e.handlePhoneAuth(ctx, conn, tgClient, message, sessionStorage, logger)
 			case "2fa":
 				if message.Password != "" {
-					go func() {
-						auth, err := tgClient.Auth().Password(ctx, message.Password)
-						if errors.Is(err, context.Canceled) {
-							return
-						}
-						if err != nil {
-							logger.Error("phone sign-in error", zap.Error(err))
-							conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
-							return
-						}
-						user, ok := auth.User.AsNotEmpty()
-						if !ok {
-							conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
-							return
-						}
-						if !checkUserIsAllowed(e.api.cnf.JWT.AllowedUsers, user.Username) {
-							conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
-							tgClient.API().AuthLogOut(ctx)
-							return
-						}
-						res, _ := sessionStorage.LoadSession(ctx)
-						sessionData := &types.SessionData{}
-						json.Unmarshal(res, sessionData)
-						session := prepareSession(user, &sessionData.Data)
-						conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
-					}()
+					go e.handle2FAAuth(ctx, conn, tgClient, message.Password, sessionStorage, logger)
 				}
 			}
 		}
 	})
 
 	if err != nil {
-		logger.Error("error running telegram client", zap.Error(err))
+		logger.Error("telegram.client_run_failed", zap.Error(err))
 		return
 	}
 }
 
-func ip4toInt(IPv4Address net.IP) int64 {
+func (e *extendedService) handleQRAuth(ctx context.Context, conn *websocket.Conn, tgClient *telegram.Client, loggedIn qrlogin.LoggedIn, sessionStorage session.Storage, logger *zap.Logger) {
+	authorization, err := tgClient.QR().Auth(ctx, loggedIn, func(ctx context.Context, token qrlogin.Token) error {
+		conn.WriteJSON(map[string]any{"type": "auth", "payload": map[string]string{"token": token.URL()}})
+		return nil
+	})
+
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	if tgerr.Is(err, "SESSION_PASSWORD_NEEDED") {
+		conn.WriteJSON(map[string]any{"type": "auth", "message": "2FA required"})
+		return
+	}
+
+	if err != nil {
+		logger.Error("auth.qr_login_failed", zap.Error(err))
+		conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
+		return
+	}
+	user, ok := authorization.User.AsNotEmpty()
+	if !ok {
+		conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
+		return
+	}
+	if !checkUserIsAllowed(e.api.cnf.JWT.AllowedUsers, user.Username) {
+		conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
+		_, _ = tgClient.API().AuthLogOut(ctx)
+		return
+	}
+	res, _ := sessionStorage.LoadSession(ctx)
+	sessionData := &types.SessionData{}
+	json.Unmarshal(res, sessionData)
+	session := prepareSession(user, &sessionData.Data)
+	conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
+}
+
+func (e *extendedService) handlePhoneAuth(ctx context.Context, conn *websocket.Conn, tgClient *telegram.Client, message *types.SocketMessage, sessionStorage session.Storage, logger *zap.Logger) {
+	switch message.Message {
+	case "sendcode":
+		res, err := tgClient.Auth().SendCode(ctx, message.PhoneNo, tgauth.SendCodeOptions{})
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+
+		if err != nil {
+			logger.Error("auth.phone_code_failed", zap.Error(err), zap.String("phone", message.PhoneNo))
+			conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
+			return
+		}
+		code := res.(*tg.AuthSentCode)
+		conn.WriteJSON(map[string]any{"type": "auth", "payload": map[string]string{"phoneCodeHash": code.PhoneCodeHash}})
+	case "signin":
+		auth, err := tgClient.Auth().SignIn(ctx, message.PhoneNo, message.PhoneCode, message.PhoneCodeHash)
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		if errors.Is(err, tgauth.ErrPasswordAuthNeeded) {
+			conn.WriteJSON(map[string]any{"type": "auth",
+				"message": tgauth.ErrPasswordAuthNeeded.Error()})
+			return
+		}
+		if tgerr.Is(err, "PHONE_CODE_INVALID") {
+			conn.WriteJSON(map[string]any{"type": "auth", "message": "PHONE_CODE_INVALID"})
+			return
+		}
+		if err != nil {
+			logger.Error("auth.phone_signin_failed", zap.Error(err), zap.String("phone", message.PhoneNo))
+			conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
+			return
+		}
+		user, ok := auth.User.AsNotEmpty()
+		if !ok {
+			conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
+			return
+		}
+		if !checkUserIsAllowed(e.api.cnf.JWT.AllowedUsers, user.Username) {
+			conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
+			_, _ = tgClient.API().AuthLogOut(ctx)
+			return
+		}
+		res, _ := sessionStorage.LoadSession(ctx)
+		sessionData := &types.SessionData{}
+		json.Unmarshal(res, sessionData)
+		session := prepareSession(user, &sessionData.Data)
+		conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
+	}
+}
+
+func (e *extendedService) handle2FAAuth(ctx context.Context, conn *websocket.Conn, tgClient *telegram.Client, password string, sessionStorage session.Storage, logger *zap.Logger) {
+	auth, err := tgClient.Auth().Password(ctx, password)
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	if err != nil {
+		logger.Error("auth.2fa_failed", zap.Error(err))
+		conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
+		return
+	}
+	user, ok := auth.User.AsNotEmpty()
+	if !ok {
+		conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
+		return
+	}
+	if !checkUserIsAllowed(e.api.cnf.JWT.AllowedUsers, user.Username) {
+		conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
+		_, _ = tgClient.API().AuthLogOut(ctx)
+		return
+	}
+	res, _ := sessionStorage.LoadSession(ctx)
+	sessionData := &types.SessionData{}
+	json.Unmarshal(res, sessionData)
+	session := prepareSession(user, &sessionData.Data)
+	conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
+}
+
+func ip4toInt(ipv4Address net.IP) int64 {
 	IPv4Int := big.NewInt(0)
-	IPv4Int.SetBytes(IPv4Address.To4())
+	IPv4Int.SetBytes(ipv4Address.To4())
 	return IPv4Int.Int64()
 }
 
@@ -389,11 +405,8 @@ func generateTgSession(dcId int, authKey []byte, port int) string {
 func checkUserIsAllowed(allowedUsers []string, userName string) bool {
 	found := false
 	if len(allowedUsers) > 0 {
-		for _, user := range allowedUsers {
-			if user == userName {
-				found = true
-				break
-			}
+		if slices.Contains(allowedUsers, userName) {
+			found = true
 		}
 	} else {
 		found = true

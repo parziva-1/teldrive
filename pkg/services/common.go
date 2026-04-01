@@ -3,7 +3,7 @@ package services
 import (
 	"context"
 	"errors"
-	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gotd/td/telegram"
@@ -21,8 +21,8 @@ import (
 )
 
 func getParts(ctx context.Context, client *telegram.Client, c cache.Cacher, file *models.File) ([]types.Part, error) {
-	return cache.Fetch(c, cache.Key("files", "messages", file.ID), 60*time.Minute, func() ([]types.Part, error) {
-		messages, err := tgc.GetMessages(ctx, client.API(), utils.Map(file.Parts, func(part api.Part) int {
+	return cache.Fetch(ctx, c, cache.KeyFileMessages(file.ID), 60*time.Minute, func() ([]types.Part, error) {
+		messages, err := tgc.GetMessages(ctx, client.API(), utils.Map(*file.Parts, func(part api.Part) int {
 			return part.ID
 		}), *file.ChannelId)
 
@@ -42,48 +42,62 @@ func getParts(ctx context.Context, client *telegram.Client, c cache.Cacher, file
 					continue
 				}
 				part := types.Part{
-					ID:   int64(file.Parts[i].ID),
+					ID:   int64((*file.Parts)[i].ID),
 					Size: document.Size,
-					Salt: file.Parts[i].Salt.Value,
+					Salt: (*file.Parts)[i].Salt.Value,
 				}
-				if file.Encrypted {
+				if *file.Encrypted {
 					part.DecryptedSize, _ = crypt.DecryptedSize(document.Size)
 				}
 				parts = append(parts, part)
 			}
 		}
-		if len(parts) != len(file.Parts) {
-			msg := "file parts mismatch"
-			logging.FromContext(ctx).Error(msg, zap.String("name", file.Name),
-				zap.Int("expected", len(file.Parts)), zap.Int("actual", len(parts)))
-			return nil, errors.New(msg)
+		if len(parts) != len(*file.Parts) {
+			logger := logging.Component("FILE")
+			logger.Error("parts.mismatch",
+				zap.String("file_id", file.ID),
+				zap.String("file_name", file.Name),
+				zap.Int("expected", len(*file.Parts)),
+				zap.Int("actual", len(parts)))
+			return nil, errors.New("file parts mismatch")
 		}
 		return parts, nil
 	})
 }
 
-func getDefaultChannel(db *gorm.DB, c cache.Cacher, userId int64) (int64, error) {
-	return cache.Fetch(c, cache.Key("users", "channel", userId), 0, func() (int64, error) {
-		var channelIds []int64
-		if err := db.Model(&models.Channel{}).Where("user_id = ?", userId).Where("selected = ?", true).
-			Pluck("channel_id", &channelIds).Error; err != nil {
-			return 0, err
-		}
-		if len(channelIds) == 0 {
-			return 0, fmt.Errorf("no default channel found for user %d", userId)
-		}
-		return channelIds[0], nil
-	})
-}
-
-func getBotsToken(db *gorm.DB, c cache.Cacher, userId, channelId int64) ([]string, error) {
-	return cache.Fetch(c, cache.Key("users", "bots", userId, channelId), 0, func() ([]string, error) {
-		var bots []string
-		if err := db.Model(&models.Bot{}).Where("user_id = ?", userId).
-			Where("channel_id = ?", channelId).Pluck("token", &bots).Error; err != nil {
-			return nil, err
-		}
-		return bots, nil
-	})
-
+func resolvePathID(db *gorm.DB, path string, userId int64) (*string, error) {
+	if !strings.HasPrefix(path, "/root") {
+		path = "/root/" + strings.Trim(path, "/")
+	}
+	var id string
+	query := `
+	WITH RECURSIVE path_parts AS (
+		SELECT ordinality as depth, part as name
+		FROM unnest(string_to_array(trim(both '/' from ?), '/')) WITH ORDINALITY as part
+	),
+	max_depth AS (
+		SELECT max(depth) as val FROM path_parts
+	),
+	hierarchy AS (
+		SELECT f.id, 1 as depth
+		FROM teldrive.files f
+		JOIN path_parts p ON p.depth = 1 AND f.name = p.name
+		WHERE f.user_id = ? AND f.parent_id IS NULL AND f.status = 'active'
+		UNION ALL
+		SELECT child.id, h.depth + 1
+		FROM teldrive.files child
+		JOIN hierarchy h ON child.parent_id = h.id
+		JOIN path_parts p ON p.depth = h.depth + 1 AND child.name = p.name
+		JOIN max_depth md ON h.depth < md.val
+		WHERE child.status = 'active'
+	)
+	SELECT id FROM hierarchy WHERE depth = (SELECT val FROM max_depth) LIMIT 1;
+	`
+	if err := db.Raw(query, path, userId).Scan(&id).Error; err != nil {
+		return nil, err
+	}
+	if id == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return &id, nil
 }

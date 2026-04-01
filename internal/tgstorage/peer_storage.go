@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"time"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/contrib/storage"
@@ -25,16 +26,16 @@ func NewPeerStorage(db *gorm.DB, prefix string) *PeerStorage {
 	}
 }
 
-type sqliteIterator struct {
+type postgresIterator struct {
 	rows  *sql.Rows
 	value storage.Peer
 }
 
-func (p *sqliteIterator) Close() error {
+func (p *postgresIterator) Close() error {
 	return p.rows.Close()
 }
 
-func (p *sqliteIterator) Next(ctx context.Context) bool {
+func (p *postgresIterator) Next(ctx context.Context) bool {
 	if !p.rows.Next() {
 		return false
 	}
@@ -54,11 +55,11 @@ func (p *sqliteIterator) Next(ctx context.Context) bool {
 	return true
 }
 
-func (p *sqliteIterator) Err() error {
+func (p *postgresIterator) Err() error {
 	return p.rows.Err()
 }
 
-func (p *sqliteIterator) Value() storage.Peer {
+func (p *postgresIterator) Value() storage.Peer {
 	return p.value
 }
 
@@ -71,7 +72,15 @@ func (s PeerStorage) Iterate(ctx context.Context) (storage.PeerIterator, error) 
 		return nil, errors.Wrap(err, "query")
 	}
 
-	return &sqliteIterator{rows: rows}, nil
+	return &postgresIterator{rows: rows}, nil
+}
+
+func (s PeerStorage) Purge(ctx context.Context) error {
+	err := s.db.Where("key LIKE ?", s.prefix+"%").Delete(&KeyValue{})
+	if err != nil {
+		return err.Error
+	}
+	return nil
 }
 
 func (s PeerStorage) add(associated []string, value storage.Peer) error {
@@ -80,6 +89,7 @@ func (s PeerStorage) add(associated []string, value storage.Peer) error {
 		if err != nil {
 			return errors.Wrap(err, "marshal")
 		}
+
 		if err := tx.Save(&KeyValue{
 			Key:   cache.Key(s.prefix, storage.KeyFromPeer(value).String()),
 			Value: data,
@@ -89,8 +99,9 @@ func (s PeerStorage) add(associated []string, value storage.Peer) error {
 
 		for _, key := range associated {
 			if err := tx.Save(&KeyValue{
-				Key:   cache.Key(s.prefix, key),
-				Value: data,
+				Key:       cache.Key(s.prefix, key),
+				Value:     data,
+				CreatedAt: time.Now().UTC(),
 			}).Error; err != nil {
 				return errors.Wrap(err, "save associated key")
 			}
@@ -114,7 +125,7 @@ func (s PeerStorage) Find(ctx context.Context, key storage.PeerKey) (storage.Pee
 	}
 
 	var p storage.Peer
-	if err := json.Unmarshal([]byte(entry.Value), &p); err != nil {
+	if err := json.Unmarshal(entry.Value, &p); err != nil {
 		if errors.Is(err, storage.ErrPeerUnmarshalMustInvalidate) {
 			return storage.Peer{}, storage.ErrPeerNotFound
 		}
@@ -122,6 +133,13 @@ func (s PeerStorage) Find(ctx context.Context, key storage.PeerKey) (storage.Pee
 	}
 
 	return p, nil
+}
+
+func (s PeerStorage) Delete(ctx context.Context, key storage.PeerKey) error {
+	if err := s.db.Where("key = ?", cache.Key(s.prefix, key.String())).Delete(&KeyValue{}).Error; err != nil {
+		return errors.Wrap(err, "query")
+	}
+	return nil
 }
 
 func (s PeerStorage) Assign(ctx context.Context, key string, value storage.Peer) error {
@@ -138,7 +156,7 @@ func (s PeerStorage) Resolve(ctx context.Context, key string) (storage.Peer, err
 	}
 
 	var p storage.Peer
-	if err := json.Unmarshal([]byte(entry.Value), &p); err != nil {
+	if err := json.Unmarshal(entry.Value, &p); err != nil {
 		if errors.Is(err, storage.ErrPeerUnmarshalMustInvalidate) {
 			return storage.Peer{}, storage.ErrPeerNotFound
 		}
